@@ -2,8 +2,16 @@
 
 module fast_isr #
 (
-    parameter IN_W  = 56,    // ??u vào u t? MAC (Qxx.26)
-    parameter OUT_W = 24     // ??u ra y_out (Q2.22)
+    // --- S?a: Tham s? ?? r?ng bit ---
+    parameter IN_W   = 56,    // ??u vào u t? MAC (Qxx.26)
+    parameter OUT_W  = 24,    // ??u ra y_out (Q2.22)
+    
+    // --- S?a: Tham s? ??nh d?ng Q-format (Quan tr?ng ?? tính toán d?ch bit) ---
+    parameter FW_IN  = 26,    // S? bit l? c?a ??u vào u_in
+    parameter FW_OUT = 22,    // S? bit l? c?a ??u ra y_out
+    
+    // --- S?a: Tham s? cho LUT ---
+    parameter LUT_ADDR_W = 8  // ?? r?ng ??a ch? LUT
 )
 (
     input  wire clk,
@@ -15,29 +23,38 @@ module fast_isr #
     output reg             done
 );
 
+    // --- S?a: T? ??ng tính toán các kho?ng d?ch bit (Shifts) d?a trên Q-format ---
+    // Newton-Raphson: y1 = 0.5 * y0 * (3.0 - u * y0^2)
+    localparam SHIFT_U_Y2 = (FW_IN + 2*FW_OUT) - FW_OUT; // T? Q70 v? Q22: 26 + 44 - 22 = 48
+    localparam SHIFT_FINAL = (2*FW_OUT) - FW_OUT + 1;    // T? Q44 v? Q22 và chia 2 (0.5): 44 - 22 + 1 = 23
+    
     // --- FSM States ---
     localparam IDLE    = 3'd0,
-               CALC_1  = 3'd1, // Tính y0^2 (Q4.44)
-               CALC_2  = 3'd2, // Tính u * y0^2 (Qxx.70)
-               CALC_3  = 3'd3, // Tính 3.0 - (u*y0^2) (Q22)
-               CALC_4  = 4'd4, // Tính y0 * diff (Q44)
+               CALC_1  = 3'd1, // Tính y0^2
+               CALC_2  = 3'd2, // Tính u * y0^2
+               CALC_3  = 3'd3, // Tính 3.0 - (u*y0^2)
+               CALC_4  = 3'd4, // Tính y0 * diff
                FINISH  = 3'd5;
 
     reg [2:0] state;
     reg [IN_W-1:0] u_reg;
-    reg [23:0]     y_initial; // Output t? LUT t? h?p
+    reg [OUT_W-1:0] y_initial; // S?a: Dùng OUT_W thay cho 24-bit hardcode
     
-    reg signed [47:0]  y0_sq_q44;
-    reg signed [103:0] u_y2_q70;
-    reg signed [31:0]  diff_q22;
-    reg signed [63:0]  prod_final_q44;
+    // S?a: ?? r?ng thanh ghi trung gian d?a trên tham s?
+    reg signed [(2*OUT_W)-1:0]      y0_sq_q44;      // y0^2 (Q4.44)
+    reg signed [(IN_W+2*OUT_W)-1:0] u_y2_q70;      // u * y0^2 (Qxx.70)
+    reg signed [OUT_W+7:0]          diff_q22;       // diff (Q22)
+    // --- S?a: Khai báo ??ng d?a trên OUT_W ?? gi? nguyên headroom 40-bit nh? b?n g?c ---
+    reg signed [(OUT_W + 40) - 1 : 0] prod_final_q44;
     
-    localparam signed [31:0] CONST_3_Q22 = 32'sd12582912; // 3.0 in Q22
+    // S?a: H?ng s? 3.0 t? ??ng tính theo FW_OUT
+    localparam signed [OUT_W+7:0] CONST_3_Q = (3 << FW_OUT); 
 
-    // --- 1. LUT T? H?P (u = index / 16) ---
-    // Vì u=1.0 n?m ? bit 26 c?a u_in, nên ?? có index = u*16 (u*2^4), 
-    // ta l?y u_in / 2^22. V?y ??a ch? LUT là u_in[29:22].
-    wire [7:0] lut_addr = (u_in[IN_W-1:30] != 0) ? 8'hFF : u_in[29:22];
+    // --- 1. LUT T? H?P ---
+    // S?a: V? trí l?y ??a ch? LUT t? ??ng theo FW_IN
+    // Index = u * 16 (d?ch trái 4 bit). N?u u=1.0 ? FW_IN, thì index ? FW_IN+4.
+    wire [LUT_ADDR_W-1:0] lut_addr = (u_in[IN_W-1 : FW_IN+4] != 0) ? {LUT_ADDR_W{1'b1}} : 
+                                      u_in[FW_IN+4-1 : FW_IN+4-LUT_ADDR_W];
 
     always @(*) begin
         case(lut_addr)
@@ -300,10 +317,12 @@ module fast_isr #
             default: y_initial = 24'h400000;
         endcase
     end
+
     // --- 2. FSM NEWTON-RAPHSON ---
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             state <= IDLE; done <= 0; y_out <= 0;
+            u_reg <= 0; y0_sq_q44 <= 0; u_y2_q70 <= 0; diff_q22 <= 0; prod_final_q44 <= 0;
         end else begin
             case (state)
                 IDLE: begin
@@ -315,39 +334,39 @@ module fast_isr #
                 end
 
                 CALC_1: begin
-                    // y0^2 (Q2.22 * Q2.22 = Q4.44)
+                    // y0^2 (FW_OUT * FW_OUT -> 2*FW_OUT)
                     y0_sq_q44 <= $signed({1'b0, y_initial}) * $signed({1'b0, y_initial});
                     state <= CALC_2;
                 end
 
                 CALC_2: begin
-                    // u * y0^2 (Qxx.26 * Q4.44 = Qxx.70)
+                    // u * y0^2 (FW_IN + 2*FW_OUT)
                     u_y2_q70 <= $signed({1'b0, u_reg}) * y0_sq_q44;
                     state <= CALC_3;
                 end
 
                 CALC_3: begin
-                    // diff = 3.0 - (u * y0^2). D?ch 48 bit t? Q70 v? Q22.
-                    diff_q22 <= CONST_3_Q22 - $signed(u_y2_q70[103:48]);
+                    // S?a: Dùng SHIFT_U_Y2 thay vì s? 48 hardcode
+                    diff_q22 <= CONST_3_Q - $signed(u_y2_q70[(IN_W+2*OUT_W)-1 : SHIFT_U_Y2]);
                     state <= CALC_4;
                 end
 
                 CALC_4: begin
-                    // prod = y0 * diff (Q2.22 * Q22 = Q44)
-                    if (diff_q22[31]) // An toàn n?u u quá l?n
-                        prod_final_q44 <= {1'b0, y_initial, 23'd0};
+                    // prod = y0 * diff
+                    if (diff_q22[OUT_W+7]) // S?a: Check bit d?u linh ho?t
+                        prod_final_q44 <= {1'b0, y_initial, {(FW_OUT+1){1'b0}}};
                     else
                         prod_final_q44 <= $signed({1'b0, y_initial}) * diff_q22;
                     state <= FINISH;
                 end
 
                 FINISH: begin
-                    // y_next = 0.5 * prod (Q44 -> d?ch 23 bit -> Q22)
-                    // Ki?m tra bão hòa n?u k?t qu? v??t quá d?i Q2.22 (l?n h?n 3.999)
-                    if (prod_final_q44[63:47] != 0) 
-                        y_out <= 24'hFFFFFF;
+                    // S?a: Dùng SHIFT_FINAL (23) thay vì s? 23 hardcode
+                    // Ki?m tra bão hòa (Overflow check)
+                    if (prod_final_q44[(OUT_W + 40) - 1 : FW_OUT+FW_IN-1] != 0) 
+                        y_out <= {OUT_W{1'b1}};
                     else
-                        y_out <= prod_final_q44[46:23]; 
+                        y_out <= prod_final_q44[SHIFT_FINAL + OUT_W - 1 : SHIFT_FINAL]; 
 
                     done  <= 1'b1;
                     state <= IDLE;
