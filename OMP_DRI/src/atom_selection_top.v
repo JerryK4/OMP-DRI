@@ -1,0 +1,118 @@
+`timescale 1ns / 1ps
+
+module atom_selection_top #
+(
+    // --- S?a: Thêm tham s? c?u hình chung ---
+    parameter NUM_MAC      = 4,     // S?a: S? b? nhân MAC song song
+    parameter DW           = 24,    // ??nh d?ng 24-bit (Q11.13 signed)
+    
+    // --- S?a: Tham s? kích th??c ?nh 16x16 ---
+    parameter ADDR_W       = 12,    // ??a ch? Phi RAM (4096 hàng)
+    parameter ROW_W        = 6,     // ??a ch? r RAM (Headroom cho M=64)
+    parameter COL_W        = 8,     // Index c?t (N=256 -> 8 bit)
+    parameter ROW_N        = 4,     // log2(64/4) = 4 (Stride ??a ch?)
+    
+    // --- S?a: Tham s? tính toán ---
+    parameter DOT_W        = 56,    // ?? r?ng k?t qu? tích vô h??ng
+    parameter MAX_I        = 16,    // Sparsity K t?i ?a
+    
+    // --- S?a: Tham s? Support Set (Masking) ---
+    parameter HIST_BIT_VLD = 1,     // Bit valid cho history
+    parameter HIST_W       = COL_W + HIST_BIT_VLD, // S?a: T? ??ng tính HIST_W (8+1=9)
+    parameter I_W          = $clog2(MAX_I) + 1    // S?a: ?? r?ng bit cho current_i
+)
+(
+    input  wire clk,
+    input  wire rst_n,
+    input  wire start,         // Xung kích ho?t t? FSM t?ng trên c?a OMP
+
+    // Tham s? c?u hình (??ng cho DRI)
+    input  wire [COL_W-1:0] N_cols, 
+    input  wire [ROW_W-1:0] M_rows, 
+
+    // Giao ti?p BRAM Ma tr?n Phi
+    output wire [ADDR_W-1:0] phi_addr,
+    input  wire [(NUM_MAC*DW)-1:0] phi_data, // S?a: Dùng NUM_MAC thay cho s? 4 c?ng
+
+    // Giao ti?p BRAM Th?ng d? r
+    output wire [ROW_W-1:0]  r_addr,
+    input  wire [(NUM_MAC*DW)-1:0] r_data,   // S?a: Dùng NUM_MAC thay cho s? 4 c?ng
+
+    // Masking Control (Support Set)
+    input  wire [I_W-1:0]          current_i,      // S?a: Dùng I_W
+    input  wire [MAX_I*HIST_W-1:0] lambda_history, 
+
+    // Output k?t qu?
+    output wire [COL_W-1:0] lambda_out, 
+    output wire             atom_done   
+);
+
+    /* --- Tín hi?u dây k?t n?i n?i b? gi?a các kh?i --- */
+    wire [DOT_W-1:0] w_dot_result;
+    wire [COL_W-1:0] w_current_col;
+    wire [ROW_W-1:0] w_row_cnt_unused; 
+    wire             w_col_done;
+    wire             w_all_done;
+
+    /* ==========================================================
+       1. Kh?i Parallel Dot Product (Tính tích vô h??ng song song)
+       S?a: Truy?n ??y ?? các Parameter m?i vào module con
+    ========================================================== */
+    dot_product_4mac #(
+        .NUM_MAC(NUM_MAC), // S?a: Truy?n s? l??ng MAC
+        .ADDR_W(ADDR_W),
+        .ROW_W(ROW_W),
+        .COL_W(COL_W),
+        .ROW_N(ROW_N),
+        .DW(DW),
+        .ACC_W(DOT_W),     // S?a: ??ng b? ?? r?ng tích l?y
+        .OUT_W(DOT_W)    
+    ) u_parallel_mac (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start_a(start),
+        
+        .N_cols(N_cols),
+        .M_rows(M_rows),
+        
+        .phi_addr(phi_addr),
+        .phi_data(phi_data),
+        
+        .r_addr(r_addr),
+        .r_data(r_data),
+        
+        .dot_result(w_dot_result),
+        .current_col_idx(w_current_col),
+        .row_cnt_out(w_row_cnt_unused), 
+        .col_done(w_col_done),
+        .all_done(w_all_done)
+    );
+
+    /* ==========================================================
+       2. Kh?i Finding Max (Comparator + Masking logic)
+       S?a: Truy?n ??y ?? các Parameter m?i vào module con
+    ========================================================== */
+    finding_max #(
+        .DOT_W(DOT_W),   
+        .COL_W(COL_W),   
+        .MAX_I(MAX_I),
+        .HIST_W(HIST_W),
+        .I_W(I_W)          // S?a: Truy?n ?? r?ng bit cho b? ??m
+    ) u_comparator_max (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start_search(start),
+        
+        .dot_result(w_dot_result),
+        .current_col_idx(w_current_col),
+        .col_done(w_col_done),
+        .all_done_in(w_all_done),
+        
+        .current_i(current_i),
+        .lambda_history(lambda_history),
+        
+        .lambda(lambda_out),
+        .finding_done(atom_done)
+    );
+
+endmodule
