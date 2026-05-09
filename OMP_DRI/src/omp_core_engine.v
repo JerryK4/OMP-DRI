@@ -1,106 +1,110 @@
 `timescale 1ns / 1ps
 
+/*
+=====================================================================================
+=   Author: Doan Duc Manh - UET - VNU                                                                                  =
+=   Module: OMP Core Engine (Top-Level Controller)                                  =
+=   Description: Manages the iterative process of Atom Selection and QR-MGS.        =
+=                                                                                   =
+=====================================================================================
+*/
+
 module omp_core_engine #
 (
-    // --- S?a: Tham s? h? th?ng ---
-    parameter NUM_MAC    = 4,     // S? b? MAC song song
-    parameter DW         = 24,    // ?? r?ng d? li?u (Q11.13)
+    // --- System Parameters ---
+    parameter NUM_MAC    = 4,     // Number of parallel MAC units
+    parameter DW         = 24,    // Data width (Q11.13)
     
-    // --- S?a: Tham s? kích th??c ?nh 16x16 ---
+    // --- Image/Matrix Dimensions (Default 16x16) ---
     parameter COL_W      = 8,     // N=256 -> 8 bit
-    parameter ROW_W      = 6,     // M_rows (M/4=16 -> c?n ít nh?t 5 bit, 6 bit an toàn)
+    parameter ROW_W      = 6,     // M_rows (M/4=16 -> 6 bit safe)
     parameter K_W        = 5,     // K=16 -> 5 bit
     parameter ROW_N      = 4,     // Stride: log2(16) = 4
     
-    // --- S?a: Tham s? ??a ch? RAM ---
-    parameter ADDR_W_PHI = 12,    // Phi RAM: (N*M)/4 = 4096 dòng
-    parameter ADDR_W_Q   = 12,    // Q RAM: (K*M)/4 = 256 dòng (16x16 dùng 8 bit, nòng lên 12 cho t??ng lai)
-    parameter ADDR_W_R   = 12,    // R RAM: K*K = 256 dòng
-    parameter ADDR_W_Y   = 6,     // Y RAM: M/4 = 16 dòng
+    // --- BRAM Address Parameters ---
+    parameter ADDR_W_PHI = 12,    
+    parameter ADDR_W_Q   = 12,    
+    parameter ADDR_W_R   = 12,    
+    parameter ADDR_W_Y   = 6,     
     
-    // --- S?a: Tham s? tính toán & Masking ---
+    // --- Computing & Masking ---
     parameter DOT_W      = 56,
     parameter MAX_I      = 16,
-    parameter HIST_BIT_V = 1,     // Bit Valid trong history
-    parameter HIST_W     = COL_W + HIST_BIT_V // S?a: T? ??ng tính 8+1=9
+    parameter HIST_BIT_V = 1,     
+    parameter HIST_W     = COL_W + HIST_BIT_V 
 )
 (
-    input  wire                  clk,
-    input  wire                  rst_n,
-    input  wire                  start_omp,    
+    input  wire                   clk,
+    input  wire                   rst_n,
+    input  wire                   start_omp,    
     
-    // Tham s? c?u hình
-    input  wire [COL_W-1:0]      N_cols,
-    input  wire [ROW_W-1:0]      M_rows,
-    input  wire [K_W-1:0]        K_sparsity,
+    // Configuration Parameters
+    input  wire [COL_W-1:0]       N_cols,
+    input  wire [ROW_W-1:0]       M_rows,
+    input  wire [K_W-1:0]         K_sparsity,
 
-    // Giao ti?p ghi Y ban ??u t? CPU/DMA
-    input  wire                  y_we_cpu,
-    input  wire [ADDR_W_Y-1:0]   y_addr_cpu,    // S?a: Dùng ADDR_W_Y
-    input  wire [(NUM_MAC*DW)-1:0] y_din_cpu,   // S?a: Dùng NUM_MAC
+    // Initial Y/Phi Write Interface (from CPU/DMA)
+    input  wire                   y_we_cpu,
+    input  wire [ADDR_W_Y-1:0]    y_addr_cpu,    
+    input  wire [(NUM_MAC*DW)-1:0] y_din_cpu,   
 
-    // B? sung: Giao ti?p ghi PHI ban ??u t? CPU/DMA
-    input  wire                  phi_we_cpu,
-    input  wire [ADDR_W_PHI-1:0] phi_addr_cpu,
-    input  wire [(NUM_MAC*DW)-1:0] phi_din_cpu, // S?a: Dùng NUM_MAC
+    input  wire                   phi_we_cpu,
+    input  wire [ADDR_W_PHI-1:0]  phi_addr_cpu,
+    input  wire [(NUM_MAC*DW)-1:0] phi_din_cpu, 
 
-    // === GIAO TI?P V?I KH?I FINAL ESTIMATION (??C BRAM) ===
-    input  wire                  est_running_flag, 
-    
-    input  wire [ADDR_W_Y-1:0]   est_y_addr_b,  // S?a: Dùng ADDR_W_Y
+    // Final Estimation Interface (Read Access)
+    input  wire                   est_running_flag, 
+    input  wire [ADDR_W_Y-1:0]    est_y_addr_b,  
     output wire [(NUM_MAC*DW)-1:0] est_y_dout_b,
 
-    input  wire [ADDR_W_Q-1:0]   est_q_addr_b,
+    input  wire [ADDR_W_Q-1:0]    est_q_addr_b,
     output wire [(NUM_MAC*DW)-1:0] est_q_dout_b,
 
-    input  wire [ADDR_W_R-1:0]   est_r_addr_b,  // S?a: Dùng ADDR_W_R
-    output wire [DW-1:0]         est_r_dout_b,
+    input  wire [ADDR_W_R-1:0]    est_r_addr_b,  
+    output wire [DW-1:0]          est_r_dout_b,
 
-    // Tín hi?u Output
-    output reg                   omp_done,
+    // Outputs
+    output reg                    omp_done,
     output wire [MAX_I*COL_W-1:0] lambda_array_out
 );
 
-    // =========================================================================
-    // 1. DÂY CÁP N?I B? (CHO KH?I OMP_CORE T? DÙNG)
-    // =========================================================================
+    //------------------------------------------------1. Internal Wiring----------------------------------------
     wire [ADDR_W_Y-1:0] core_y_addr_b;
     wire [ADDR_W_Q-1:0] core_q_addr_b;
 
-    // =========================================================================
-    // 2. MUX CHIA S? BRAM (CORE vs FINAL_EST)
-    // =========================================================================
+    // Sharing MUX for BRAMs (Engine vs Final Estimation)
     wire [ADDR_W_Y-1:0] final_y_addr_b = est_running_flag ? est_y_addr_b : core_y_addr_b;
     wire [ADDR_W_Q-1:0] final_q_addr_b = est_running_flag ? est_q_addr_b : core_q_addr_b;
 
-    // =========================================================================
-    // 3. INSTANTIATE BRAM IPs (S?a: S? d?ng NUM_MAC và Parameter ??a ch?)
-    // =========================================================================
-    
-    wire [ADDR_W_PHI-1:0] phi_addr_b; 
+    //------------------------------------------------2. Memory Subsystem---------------------------------------
+    // PHI BRAM: Stores the Dictionary
+    wire [ADDR_W_PHI-1:0]   phi_addr_b; 
     wire [(NUM_MAC*DW)-1:0] phi_dout_b;
     phi_bram u_phi_ram (
         .clka(clk),  .wea(phi_we_cpu), .addra(phi_addr_cpu), .dina(phi_din_cpu), 
         .clkb(clk),  .addrb(phi_addr_b), .doutb(phi_dout_b)
     );
 
+    // Y BRAM: Stores the observation vector
     wire [(NUM_MAC*DW)-1:0] y_dout_b;
     y_bram u_y_ram (
         .clka(clk),  .wea(y_we_cpu), .addra(y_addr_cpu), .dina(y_din_cpu), 
-        .clkb(clk),  .addrb(final_y_addr_b), .doutb(y_dout_b)              
+        .clkb(clk),  .addrb(final_y_addr_b), .doutb(y_dout_b)                     
     );
     assign est_y_dout_b = y_dout_b; 
 
-    wire [ADDR_W_Y-1:0]  res_addr_a, res_addr_b; // S?a: ??ng b? v?i Y addr
-    wire        res_we_a; 
+    // Residual RAM: Workhorse for the OMP iterations
+    wire [ADDR_W_Y-1:0]     res_addr_a, res_addr_b; 
+    wire                    res_we_a; 
     wire [(NUM_MAC*DW)-1:0] res_din_a, res_dout_b;
     res_vec_ram u_res_ram (
         .clka(clk),  .wea(res_we_a), .addra(res_addr_a), .dina(res_din_a),
         .clkb(clk),  .addrb(res_addr_b), .doutb(res_dout_b)
     );
 
-    wire [ADDR_W_Q-1:0] q_addr_a; 
-    wire                q_we_a; 
+    // Q & R RAMs: Stores the QR decomposition results
+    wire [ADDR_W_Q-1:0]     q_addr_a; 
+    wire                    q_we_a; 
     wire [(NUM_MAC*DW)-1:0] q_din_a, q_dout_b;
     q_bram u_q_ram (
         .clka(clk),  .wea(q_we_a), .addra(q_addr_a), .dina(q_din_a), .douta(),
@@ -108,36 +112,30 @@ module omp_core_engine #
     );
     assign est_q_dout_b = q_dout_b; 
 
-    wire [ADDR_W_R-1:0]  r_addr_a; 
-    wire        r_we_a; 
-    wire [DW-1:0] r_din_a, r_dout_b;
+    wire [ADDR_W_R-1:0]     r_addr_a; 
+    wire                    r_we_a; 
+    wire [DW-1:0]           r_din_a, r_dout_b;
     r_bram u_r_ram (
         .clka(clk),  .wea(r_we_a), .addra(r_addr_a), .dina(r_din_a), .douta(),
         .clkb(clk),  .web(1'b0), .addrb(est_r_addr_b), .dinb({DW{1'b0}}), .doutb(r_dout_b) 
     );
     assign est_r_dout_b = r_dout_b;
 
-    // =========================================================================
-    // 4. FSM STATES & REGISTERS
-    // =========================================================================
-    localparam ST_IDLE         = 4'd0,
-               ST_INIT_COPY    = 4'd1, 
-               ST_START_ATOM   = 4'd2, 
-               ST_WAIT_ATOM    = 4'd3, 
-               ST_LATCH_LAMBDA = 4'd4, 
-               ST_START_QR     = 4'd5, 
-               ST_WAIT_QR      = 4'd6, 
-               ST_CHECK_LOOP   = 4'd7, 
+    //------------------------------------------------3. Master FSM & Control-----------------------------------
+    localparam ST_IDLE         = 4'd0, ST_INIT_COPY    = 4'd1, 
+               ST_START_ATOM   = 4'd2, ST_WAIT_ATOM    = 4'd3, 
+               ST_LATCH_LAMBDA = 4'd4, ST_START_QR     = 4'd5, 
+               ST_WAIT_QR      = 4'd6, ST_CHECK_LOOP   = 4'd7, 
                ST_FINISH       = 4'd8; 
 
     reg [3:0]        state;
-    reg [ROW_W-1:0]  init_cnt;   // S?a: Dùng ROW_W
-    reg [K_W-1:0]    current_k;  // S?a: Dùng K_W
+    reg [ROW_W-1:0]  init_cnt;   
+    reg [K_W-1:0]    current_k;  
 
     reg  atom_start; wire atom_done; wire [COL_W-1:0] lambda_val;
     reg  qr_start;   wire qr_done;   reg  [COL_W-1:0] last_lambda;
 
-    // L?ch s? Lambda
+    // Lambda History Tracking
     reg [HIST_W-1:0] lambda_history [0:MAX_I-1];
     wire [MAX_I*HIST_W-1:0] lambda_history_flat;
     genvar g;
@@ -148,36 +146,27 @@ module omp_core_engine #
         end
     endgenerate
 
-    // =========================================================================
-    // 5. ??NG B? COPY Y -> RES_BRAM (S?a: Tham s? hóa Counter)
-    // =========================================================================
+    //------------------------------------------------4. Initial Data Copy (Y to RES)---------------------------
     reg [ADDR_W_Y-1:0] y_addr_b_reg;
     assign core_y_addr_b = y_addr_b_reg;
 
-    reg       res_we_init;
+    reg                res_we_init;
     reg [ADDR_W_Y-1:0] res_wa_init;
     
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            res_we_init <= 1'b0; 
-            res_wa_init <= 0;
+            res_we_init <= 1'b0; res_wa_init <= 0;
         end else begin
             if (state == ST_INIT_COPY) begin
                 if (init_cnt <= M_rows) begin
                     res_we_init <= 1'b1; 
                     res_wa_init <= init_cnt[ADDR_W_Y-1:0]; 
-                end else begin
-                    res_we_init <= 1'b0; 
-                end
-            end else begin
-                res_we_init <= 1'b0;
-            end
+                end else res_we_init <= 1'b0; 
+            end else res_we_init <= 1'b0;
         end
     end
 
-    // =========================================================================
-    // 6. B? PHÂN X? MUX N?I B? (S?a: Tham s? hóa ??a ch?)
-    // =========================================================================
+    //------------------------------------------------5. Internal Bus MUXing------------------------------------
     wire [ADDR_W_PHI-1:0] atom_phi_addr, qr_phi_addr;
     wire [ADDR_W_Y-1:0]   atom_res_addr, qr_res_addr_b, qr_res_addr_a;
     wire                  qr_res_we_a;
@@ -192,9 +181,7 @@ module omp_core_engine #
     assign res_addr_a = (state == ST_INIT_COPY) ? res_wa_init : qr_res_addr_a;
     assign res_din_a  = (state == ST_INIT_COPY) ? y_dout_b    : qr_res_din_a;
 
-    // =========================================================================
-    // 7. INSTANTIATE SUB-MODULES (S?a: Truy?n ??y ?? Parameter)
-    // =========================================================================
+    //------------------------------------------------6. Processing Sub-modules---------------------------------
     atom_selection_top #(
         .NUM_MAC(NUM_MAC), .DW(DW), .ADDR_W(ADDR_W_PHI), .ROW_W(ROW_W), 
         .COL_W(COL_W), .ROW_N(ROW_N), .DOT_W(DOT_W), .MAX_I(MAX_I)
@@ -222,17 +209,13 @@ module omp_core_engine #
         .core_done(qr_done)
     );
 
-    // =========================================================================
-    // 8. MASTER FSM (S?a: S? d?ng Parameter cho counter và Index)
-    // =========================================================================
+    //------------------------------------------------7. Master State Logic-------------------------------------
     integer im;
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            state       <= ST_IDLE;
-            init_cnt    <= 0; 
-            current_k   <= 0;
-            y_addr_b_reg <= {ADDR_W_Y{1'b1}}; // S?a: Reset v? c?c ??i ?? addr 0 là nh?p ??u
-            omp_done    <= 0; atom_start <= 0; qr_start <= 0; last_lambda <= 0;
+            state <= ST_IDLE; init_cnt <= 0; current_k <= 0;
+            y_addr_b_reg <= {ADDR_W_Y{1'b1}}; 
+            omp_done <= 0; atom_start <= 0; qr_start <= 0; last_lambda <= 0;
             for (im=0; im<MAX_I; im=im+1) lambda_history[im] <= 0;
         end else begin
             atom_start <= 1'b0; qr_start <= 1'b0; omp_done <= 1'b0;
@@ -240,23 +223,15 @@ module omp_core_engine #
             case (state)
                 ST_IDLE: begin
                     if (start_omp) begin
-                        state     <= ST_INIT_COPY; 
-                        init_cnt  <= 0; 
-                        y_addr_b_reg <= 0; 
-                        current_k <= 0;
+                        state <= ST_INIT_COPY; init_cnt <= 0; y_addr_b_reg <= 0; current_k <= 0;
                         for (im=0; im<MAX_I; im=im+1) lambda_history[im] <= 0;
                     end
                 end
                 
                 ST_INIT_COPY: begin 
-                    if (init_cnt < M_rows) begin
-                        y_addr_b_reg <= init_cnt[ADDR_W_Y-1:0] + 1'b1;
-                    end
-                    if (init_cnt >= M_rows + 2'd2) begin
-                        state <= ST_START_ATOM;
-                    end else begin
-                        init_cnt <= init_cnt + 1'b1;
-                    end
+                    if (init_cnt < M_rows) y_addr_b_reg <= init_cnt[ADDR_W_Y-1:0] + 1'b1;
+                    if (init_cnt >= M_rows + 2'd2) state <= ST_START_ATOM;
+                    else init_cnt <= init_cnt + 1'b1;
                 end
                 
                 ST_START_ATOM: begin atom_start <= 1'b1; state <= ST_WAIT_ATOM; end
@@ -268,8 +243,8 @@ module omp_core_engine #
                     state <= ST_START_QR;
                 end
                 
-                ST_START_QR: begin qr_start <= 1'b1; state <= ST_WAIT_QR; end
-                ST_WAIT_QR:  if (qr_done) state <= ST_CHECK_LOOP;
+                ST_START_QR:   begin qr_start <= 1'b1; state <= ST_WAIT_QR; end
+                ST_WAIT_QR:    if (qr_done) state <= ST_CHECK_LOOP;
                 
                 ST_CHECK_LOOP: begin
                     if (current_k == K_sparsity - 1'b1) state <= ST_FINISH; 
@@ -277,7 +252,7 @@ module omp_core_engine #
                 end
                 
                 ST_FINISH: begin omp_done <= 1'b1; state <= ST_IDLE; end
-                default: state <= ST_IDLE;
+                default:   state <= ST_IDLE;
             endcase
         end
     end

@@ -1,92 +1,97 @@
 `timescale 1ns / 1ps
 
+/*
+=====================================================================================
+=                                                                                   =
+=   Author: Doan Duc Manh - UET - VNU                                               =
+=   Module: QR MGS Core (Pipelined Architecture)                                    =
+=                                                                                   =
+=====================================================================================
+*/
+
 module qr_mgs_core #
 (
-    // --- S?a: Tham s? h? th?ng ---
-    parameter NUM_MAC    = 4,     // S? b? MAC song song
-    parameter DW         = 24,    // ?? r?ng d? li?u (Q11.13)
-    parameter DOT_W      = 56,    // ?? r?ng b? tích l?y
+    // --- System Parameters ---
+    parameter NUM_MAC      = 4,     // S? b? MAC song song
+    parameter DW           = 24,    // ?? r?ng d? li?u (Q11.13)
+    parameter DOT_W        = 56,    // ?? r?ng b? tích l?y
     
-    // --- S?a: Tham s? kích th??c ?nh (M?c ??nh cho 16x16) ---
-    parameter COL_W      = 8,     // N=256 -> 8 bit
-    parameter I_W        = 4,     // K=16 -> 4 bit
-    parameter M_W        = 6,     // M=64 -> 6 bit
-    parameter ROW_N      = 4,     // Stride: log2(M/NUM_MAC) = log2(64/4) = 4
+    // --- Image/Matrix Dimensions ---
+    parameter COL_W        = 8,     // N=256 -> 8 bit
+    parameter I_W          = 4,     // K=16 -> 4 bit
+    parameter M_W          = 6,     // M=64 -> 6 bit
+    parameter ROW_N        = 4,     // Stride: log2(M/NUM_MAC)
     
-    // --- S?a: Tham s? ??a ch? RAM ---
-    parameter ADDR_W_PHI = 12,    // 4096 deep
-    parameter ADDR_W_Q   = 12,    // S?a: T?ng lên 12 ?? ?? cho ?nh l?n sau này
-    parameter ADDR_W_R   = 12,    
+    // --- BRAM Address Parameters ---
+    parameter ADDR_W_PHI   = 12,    
+    parameter ADDR_W_Q     = 12,    
+    parameter ADDR_W_R     = 12,    
     
-    // --- S?a: Tham s? Q-format ---
-    parameter FW_DATA    = 13,    // S? bit l? c?a d? li?u
-    parameter FW_ISR     = 22     // S? bit l? ??u ra ISR
+    // --- Q-format Parameters ---
+    parameter FW_DATA      = 13,    // Fixed-point fractional bits
+    parameter FW_ISR       = 22     // ISR output fractional bits
 )
 (
-    input  wire                  clk, 
-    input  wire                  rst_n, 
-    input  wire                  start_core,      
+    input  wire                    clk, 
+    input  wire                    rst_n, 
+    input  wire                    start_core,      
     
-    // Tham s? t? FSM T?ng
-    input  wire [COL_W-1:0]      lambda_i,   // S?a: Dùng COL_W
-    input  wire [I_W-1:0]        current_i,  // S?a: Dùng I_W
-    input  wire [M_W-1:0]        M_rows_in,  // S?a: Dùng M_W
+    // Parameters from Main FSM
+    input  wire [COL_W-1:0]        lambda_i,   
+    input  wire [I_W-1:0]          current_i,  
+    input  wire [M_W-1:0]          M_rows_in,  
 
-    // Giao ti?p Phi BRAM 
-    output wire [ADDR_W_PHI-1:0] phi_addr,
-    input  wire [(NUM_MAC*DW)-1:0] phi_data, // S?a: Dùng NUM_MAC
+    // Phi BRAM Interface
+    output wire [ADDR_W_PHI-1:0]   phi_addr,
+    input  wire [(NUM_MAC*DW)-1:0] phi_data, 
 
-    // Giao ti?p R BRAM 
-    output reg  [ADDR_W_R-1:0]   r_addr_a,   // S?a: Dùng ADDR_W_R
-    output reg                   r_we_a,
-    output reg  [DW-1:0]         r_din_a,
+    // R BRAM Interface
+    output reg  [ADDR_W_R-1:0]     r_addr_a,   
+    output reg                     r_we_a,
+    output reg  [DW-1:0]           r_din_a,
 
-    // Giao ti?p Q BRAM 
-    output wire [ADDR_W_Q-1:0]   q_addr_a,   // S?a: Dùng ADDR_W_Q
-    output wire                  q_we_a,
+    // Q BRAM Interface
+    output wire [ADDR_W_Q-1:0]     q_addr_a,   
+    output wire                    q_we_a,
     output wire [(NUM_MAC*DW)-1:0] q_din_a,
-    output wire [ADDR_W_Q-1:0]   q_addr_b,
+    output wire [ADDR_W_Q-1:0]     q_addr_b,
     input  wire [(NUM_MAC*DW)-1:0] q_dout_b,
 
-    // Giao ti?p Residual RAM 
-    output wire [M_W-1:0]        res_addr_a, // S?a: Dùng M_W
-    output wire                  res_we_a,
+    // Residual RAM Interface
+    output wire [M_W-1:0]          res_addr_a, 
+    output wire                    res_we_a,
     output wire [(NUM_MAC*DW)-1:0] res_din_a,
-    output wire [M_W-1:0]        res_addr_b, 
+    output wire [M_W-1:0]          res_addr_b, 
     input  wire [(NUM_MAC*DW)-1:0] res_dout_b,
 
-    output reg                   core_done
+    output reg                     core_done
 );
 
-    // --- S?a: Tính toán ?? sâu b? nh? ??m W n?i b? ---
+    //------------------------------------------------Local Parameters------------------------------------------
     localparam W_DEPTH = 1 << ROW_N; 
 
-    // =========================================================================
-    // 1. FSM STATES (Gi? nguyên)
-    // =========================================================================
-    localparam IDLE       = 4'd0, LOAD_W = 4'd1, J_INIT = 4'd2, TRG_MAC = 4'd3, 
-               WAIT_MAC   = 4'd4, RJI_SUB = 4'd5, TRG_U = 4'd6, WAIT_U = 4'd7, 
-               TRG_ISR    = 4'd8, WAIT_ISR = 4'd9, NORM_Q = 4'd10, TRG_ALPHA = 4'd11, 
-               WAIT_ALPHA = 4'd12, UPD_RESID = 4'd13;
+    localparam IDLE       = 4'd0,  LOAD_W     = 4'd1,  J_INIT     = 4'd2,  TRG_MAC    = 4'd3, 
+               WAIT_MAC   = 4'd4,  RJI_SUB    = 4'd5,  TRG_U      = 4'd6,  WAIT_U     = 4'd7, 
+               TRG_ISR    = 4'd8,  WAIT_ISR   = 4'd9,  NORM_Q     = 4'd10, TRG_ALPHA  = 4'd11, 
+               WAIT_ALPHA = 4'd12, UPD_RESID  = 4'd13;
 
-    reg [3:0] state;
-    reg [I_W-1:0] j_cnt;      // S?a: Dùng I_W
-    reg [M_W-1:0] r_ptr;      // S?a: Dùng M_W
+    //------------------------------------------------Internal Registers----------------------------------------
+    reg [3:0]           state;
+    reg [I_W-1:0]       j_cnt;      
+    reg [M_W-1:0]       r_ptr;      
     
     reg signed [DW-1:0] r_ji_reg, isr_reg, alpha_reg;
-    reg mac_start, isr_start, mac_done_latch;
+    reg                 mac_start, isr_start, mac_done_latch;
 
-    // =========================================================================
-    // 2. B? ??m W (S?a: Tham s? hóa ?? r?ng và ?? sâu)
-    // =========================================================================
-    wire        w_we_a; 
-    wire [M_W-1:0]  w_addr_a; 
+    //------------------------------------------------1. Internal Buffer W--------------------------------------
+    wire                    w_we_a; 
+    wire [M_W-1:0]          w_addr_a; 
     wire [(NUM_MAC*DW)-1:0] w_din_a; 
-    wire [M_W-1:0]  w_addr_b;
+    wire [M_W-1:0]          w_addr_b;
     wire [(NUM_MAC*DW)-1:0] w_dout_b;
     
-    reg [(NUM_MAC*DW)-1:0] w_ram [0:W_DEPTH-1];
-    reg [(NUM_MAC*DW)-1:0] w_dout_reg;
+    reg [(NUM_MAC*DW)-1:0]  w_ram [0:W_DEPTH-1];
+    reg [(NUM_MAC*DW)-1:0]  w_dout_reg;
     
     always @(posedge clk) begin
         if(w_we_a) w_ram[w_addr_a] <= w_din_a;
@@ -94,13 +99,11 @@ module qr_mgs_core #
     end
     assign w_dout_b = w_dout_reg;
 
-    // =========================================================================
-    // 3. ??NH TUY?N ??A CH? (S?a: S? d?ng ROW_N ?? tính Stride)
-    // =========================================================================
-    wire [DOT_W-1:0] mac_res; 
-    wire mac_done_p; 
-    wire [M_W-1:0] mac_r_addr; 
-    wire [ADDR_W_PHI-1:0] mac_phi_addr_p;
+    //------------------------------------------------2. Address Routing----------------------------------------
+    wire [DOT_W-1:0]        mac_res; 
+    wire                    mac_done_p; 
+    wire [M_W-1:0]          mac_r_addr; 
+    wire [ADDR_W_PHI-1:0]   mac_phi_addr_p;
 
     wire is_mac_j = (state == TRG_MAC   || state == WAIT_MAC);
     wire is_mac_u = (state == TRG_U     || state == WAIT_U);
@@ -109,13 +112,12 @@ module qr_mgs_core #
     wire [(NUM_MAC*DW)-1:0] mac_in_phi = is_mac_u ? w_dout_b   : q_dout_b; 
     wire [(NUM_MAC*DW)-1:0] mac_in_r   = is_mac_i ? res_dout_b : w_dout_b; 
 
-    // S?a: Thay phép nhân *16 b?ng d?ch bit << ROW_N
     assign phi_addr = (state == LOAD_W) ? (lambda_i << ROW_N) + r_ptr : mac_phi_addr_p;
     
     assign q_addr_b = is_mac_j ? ((j_cnt << ROW_N) + mac_phi_addr_p) : 
                       is_mac_i ? ((current_i << ROW_N) + mac_phi_addr_p) : 
-                      (state == RJI_SUB) ? ((j_cnt << ROW_N) + r_ptr) :          
-                      (state == UPD_RESID) ? ((current_i << ROW_N) + r_ptr) : {ADDR_W_Q{1'b0}};
+                      (state == RJI_SUB)    ? ((j_cnt << ROW_N) + r_ptr) :           
+                      (state == UPD_RESID)  ? ((current_i << ROW_N) + r_ptr) : {ADDR_W_Q{1'b0}};
 
     assign w_addr_b = (is_mac_j || is_mac_u) ? mac_r_addr :
                       (state == RJI_SUB || state == NORM_Q)  ? r_ptr : {M_W{1'b0}};
@@ -123,9 +125,7 @@ module qr_mgs_core #
     assign res_addr_b = is_mac_i ? mac_r_addr :
                         (state == UPD_RESID)  ? r_ptr : {M_W{1'b0}};
 
-    // =========================================================================
-    // 4. DATAPATH: CÁC KH?I TOÁN H?C (S?a: Truy?n Parameter)
-    // =========================================================================
+    //------------------------------------------------3. Mathematical Units-------------------------------------
     dot_product_4mac #(.NUM_MAC(NUM_MAC), .ROW_W(M_W), .ROW_N(ROW_N), .DW(DW), .ACC_W(DOT_W), .OUT_W(DOT_W)) u_mac (
         .clk(clk), .rst_n(rst_n), .start_a(mac_start), 
         .N_cols({COL_W{1'b0}}), .M_rows(M_rows_in),
@@ -142,7 +142,7 @@ module qr_mgs_core #
 
     reg [DW-1:0] mul_scalar; reg [5:0] mul_shift; wire [(NUM_MAC*DW)-1:0] mul_res, sub_res;
     wire [(NUM_MAC*DW)-1:0] mul_vector_in = (state == NORM_Q) ? w_dout_b : q_dout_b; 
-    reg [(NUM_MAC*DW)-1:0] vec_from_ram, vec_delay_1;
+    reg [(NUM_MAC*DW)-1:0]  vec_from_ram, vec_delay_1;
     
     mul_scalar_4set #(.DW(DW), .SW(DW), .NUM_SET(NUM_MAC)) u_mul (
         .clk(clk), .rst_n(rst_n), 
@@ -155,53 +155,61 @@ module qr_mgs_core #
         .b_vec(mul_res), .res_vec(sub_res)
     );
 
-    // =========================================================================
-    // 5. THE GOLDEN PIPELINE (S?a: Tham s? hóa ?? r?ng ??a ch? Pipeline)
-    // =========================================================================
+    //------------------------------------------------4. The Golden Pipeline------------------------------------
     reg [M_W-1:0] addr_p1, addr_p2, addr_p3, addr_p4;
     reg we_load_p1, we_nrm_p1, we_nrm_p2, we_nrm_p3;
     reg we_sub_p1, we_sub_p2, we_sub_p3, we_sub_p4, is_rji_p1, is_rji_p2, is_rji_p3, is_rji_p4;
 
     always @(posedge clk or negedge rst_n) begin
         if(!rst_n) begin
-            addr_p1 <= 0; addr_p2 <= 0; addr_p3 <= 0; addr_p4 <= 0;
-            we_load_p1 <= 0; we_nrm_p1 <= 0; we_nrm_p2 <= 0; we_nrm_p3 <= 0; 
-            we_sub_p1 <= 0; we_sub_p2 <= 0; we_sub_p3 <= 0; we_sub_p4 <= 0; 
-            is_rji_p1 <= 0; is_rji_p2 <= 0; is_rji_p3 <= 0; is_rji_p4 <= 0; 
+            {addr_p1, addr_p2, addr_p3, addr_p4} <= 0;
+            {we_load_p1, we_nrm_p1, we_nrm_p2, we_nrm_p3} <= 0;
+            {we_sub_p1, we_sub_p2, we_sub_p3, we_sub_p4} <= 0;
+            {is_rji_p1, is_rji_p2, is_rji_p3, is_rji_p4} <= 0;
             vec_from_ram <= 0; vec_delay_1 <= 0;
         end else begin
-            addr_p1   <= r_ptr;
-            we_load_p1<= (state == LOAD_W)    && (r_ptr <= M_rows_in);
-            we_nrm_p1 <= (state == NORM_Q)    && (r_ptr <= M_rows_in);
-            we_sub_p1 <= (state == RJI_SUB || state == UPD_RESID) && (r_ptr <= M_rows_in);
-            is_rji_p1 <= (state == RJI_SUB);
+            // Pipeline Stage 1
+            addr_p1    <= r_ptr;
+            we_load_p1 <= (state == LOAD_W)    && (r_ptr <= M_rows_in);
+            we_nrm_p1  <= (state == NORM_Q)    && (r_ptr <= M_rows_in);
+            we_sub_p1  <= (state == RJI_SUB || state == UPD_RESID) && (r_ptr <= M_rows_in);
+            is_rji_p1  <= (state == RJI_SUB);
 
-            addr_p2   <= addr_p1; we_nrm_p2 <= we_nrm_p1; we_sub_p2 <= we_sub_p1; is_rji_p2 <= is_rji_p1;
+            // Pipeline Stage 2
+            addr_p2    <= addr_p1; 
+            we_nrm_p2  <= we_nrm_p1; 
+            we_sub_p2  <= we_sub_p1; 
+            is_rji_p2  <= is_rji_p1;
             vec_from_ram <= (we_sub_p1) ? (is_rji_p1 ? w_dout_b : res_dout_b) : {(NUM_MAC*DW){1'b0}};
 
-            addr_p3   <= addr_p2; we_nrm_p3 <= we_nrm_p2; we_sub_p3 <= we_sub_p2; is_rji_p3 <= is_rji_p2;
+            // Pipeline Stage 3
+            addr_p3    <= addr_p2; 
+            we_nrm_p3  <= we_nrm_p2; 
+            we_sub_p3  <= we_sub_p2; 
+            is_rji_p3  <= is_rji_p2;
             vec_delay_1 <= vec_from_ram; 
 
-            addr_p4   <= addr_p3; we_sub_p4 <= we_sub_p3; is_rji_p4 <= is_rji_p3;
+            // Pipeline Stage 4
+            addr_p4    <= addr_p3; 
+            we_sub_p4  <= we_sub_p3; 
+            is_rji_p4  <= is_rji_p3;
         end
     end
 
-    // GHI RAM (S?a: Tham s? hóa ??a ch? và Stride)
-    assign w_we_a   = we_load_p1 | (we_sub_p4 & is_rji_p4);
-    assign w_addr_a = we_load_p1 ? addr_p1 : addr_p4;
-    assign w_din_a  = we_load_p1 ? phi_data : sub_res;
+    // RAM Write Assignments
+    assign w_we_a     = we_load_p1 | (we_sub_p4 & is_rji_p4);
+    assign w_addr_a   = we_load_p1 ? addr_p1 : addr_p4;
+    assign w_din_a    = we_load_p1 ? phi_data : sub_res;
 
-    assign q_we_a   = we_nrm_p3;
-    assign q_addr_a = (current_i << ROW_N) + addr_p3; // S?a: Dùng d?ch bit
-    assign q_din_a  = mul_res;
+    assign q_we_a     = we_nrm_p3;
+    assign q_addr_a   = (current_i << ROW_N) + addr_p3; 
+    assign q_din_a    = mul_res;
 
     assign res_we_a   = (we_sub_p4 & ~is_rji_p4);
     assign res_addr_a = addr_p4;
     assign res_din_a  = sub_res;
 
-    // =========================================================================
-    // 6. FSM ?I?U KHI?N (Gi? nguyên logic)
-    // =========================================================================
+    //------------------------------------------------5. Control FSM--------------------------------------------
     always @(posedge clk or negedge rst_n) begin
         if(!rst_n) begin 
             state <= IDLE; core_done <= 0; mac_start <= 0; isr_start <= 0; mac_done_latch <= 0; 
@@ -228,16 +236,16 @@ module qr_mgs_core #
 
                 WAIT_MAC: begin
                     if(mac_done_latch) begin 
-                        r_ji_reg <= mac_res[FW_DATA +: DW]; // S?a: Dùng FW_DATA
+                        r_ji_reg <= mac_res[FW_DATA +: DW]; 
                         state <= RJI_SUB; r_ptr <= 0; mac_done_latch <= 0; 
                     end
                 end
 
                 RJI_SUB: begin
-                    mul_scalar <= r_ji_reg; mul_shift <= FW_DATA; // S?a: Dùng FW_DATA
+                    mul_scalar <= r_ji_reg; mul_shift <= FW_DATA; 
                     if (r_ptr == 0) begin
                         r_we_a   <= 1'b1; 
-                        r_addr_a <= (j_cnt << ROW_N) + current_i; // S?a: Dùng ROW_N
+                        r_addr_a <= (j_cnt << ROW_N) + current_i; 
                         r_din_a  <= r_ji_reg;
                     end
                     if(r_ptr >= M_rows_in + 4) begin 
@@ -260,10 +268,10 @@ module qr_mgs_core #
                 end
 
                 NORM_Q: begin
-                    mul_scalar <= isr_reg; mul_shift <= FW_ISR; // S?a: Dùng FW_ISR
+                    mul_scalar <= isr_reg; mul_shift <= FW_ISR; 
                     if (r_ptr == 0) begin
                         r_we_a   <= 1'b1; 
-                        r_addr_a <= (current_i << ROW_N) + current_i; // S?a: Dùng ROW_N
+                        r_addr_a <= (current_i << ROW_N) + current_i; 
                         r_din_a  <= isr_reg;
                     end
                     if(r_ptr >= M_rows_in + 3) begin state <= TRG_ALPHA; r_ptr <= 0; end 
@@ -274,13 +282,13 @@ module qr_mgs_core #
 
                 WAIT_ALPHA: begin
                     if(mac_done_latch) begin 
-                        alpha_reg <= mac_res[FW_DATA +: DW]; // S?a: Dùng FW_DATA
+                        alpha_reg <= mac_res[FW_DATA +: DW]; 
                         state <= UPD_RESID; r_ptr <= 0; mac_done_latch <= 0; 
                     end
                 end
 
                 UPD_RESID: begin
-                    mul_scalar <= alpha_reg; mul_shift <= FW_DATA; // S?a: Dùng FW_DATA
+                    mul_scalar <= alpha_reg; mul_shift <= FW_DATA; 
                     if(r_ptr >= M_rows_in + 4) begin core_done <= 1; state <= IDLE; end 
                     else r_ptr <= r_ptr + 1'b1;
                 end
@@ -290,5 +298,3 @@ module qr_mgs_core #
         end
     end
 endmodule
-
-
