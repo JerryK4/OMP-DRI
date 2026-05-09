@@ -6,6 +6,7 @@
 #include "xil_cache.h"
 #include "xil_printf.h"
 #include "sleep.h"
+#include "xtime_l.h"
 #include "omp_test_data.h"
 
 #define OMP_BASE        0x43C00000
@@ -24,6 +25,11 @@ u32 K_CFG[3] = {4, 6, 16};
 u32 x_results[16] __attribute__((aligned(32)));
 XAxiDma dma_yx, dma_phi;
 
+// Hàm tính thời gian ra Micro giây (us)
+double get_time_us(XTime start, XTime end) {
+    return (double)(end - start) * 1000000.0 / (double)COUNTS_PER_SECOND;
+}
+
 void print_float_custom(u32 hex_val) {
     int s_val = (hex_val & 0x800000) ? (hex_val | 0xFF000000) : hex_val;
     float f = (float)s_val / 8192.0f;
@@ -34,6 +40,10 @@ void print_float_custom(u32 hex_val) {
 }
 
 int main() {
+	XTime tStart, tEnd;
+    double stage_time_us;
+    double total_time_us = 0;
+
     xil_printf("\r\n===================================================\r\n");
     xil_printf("   OMP-DRI HARDWARE ACCELERATION (ZYNQ-7000)   \r\n");
     xil_printf("===================================================\r\n");
@@ -77,6 +87,11 @@ int main() {
         Xil_DCacheInvalidateRange((UINTPTR)x_results, K_CFG[s] * 4);
         XAxiDma_SimpleTransfer(&dma_yx, (UINTPTR)x_results, K_CFG[s] * 4, XAXIDMA_DEVICE_TO_DMA);
 
+		// ========================================================
+        // BẮT ĐẦU ĐO THỜI GIAN (us)
+        // ========================================================
+        XTime_GetTime(&tStart);
+
         // Kích hoạt lõi OMP
         Xil_Out32(OMP_BASE + R_CTRL, 0x01);
 
@@ -84,10 +99,17 @@ int main() {
         int timeout = 20000000;
         while(XAxiDma_Busy(&dma_yx, XAXIDMA_DEVICE_TO_DMA) && timeout > 0) { timeout--; }
 
+		XTime_GetTime(&tEnd);
+        // ========================================================
+
+        stage_time_us = get_time_us(tStart, tEnd);
+        total_time_us += stage_time_us;
+
         if(timeout == 0) {
             xil_printf(" [!] Loi: Stage %d bi treo!\r\n", s+1);
         } else {
             Xil_DCacheInvalidateRange((UINTPTR)x_results, K_CFG[s] * 4);
+			printf(" >> Thoi gian thuc thi: %.2f us\r\n", stage_time_us);
             xil_printf(" >> KET QUA STAGE %d:\r\n", s+1);
             xil_printf(" No | Pixel Index (Lambda) | Cuong do\r\n");
             xil_printf(" ------------------------------------\r\n");
@@ -107,6 +129,7 @@ int main() {
 
     xil_printf("\r\n===================================================\r\n");
     xil_printf("             HOAN TAT QUY TRINH DRI\r\n");
+	printf(" TONG THOI GIAN THUC THI TOAN THUAT TOAN: %.2f us\r\n", total_time_us);
     xil_printf("===================================================\r\n");
 
     return 0;
