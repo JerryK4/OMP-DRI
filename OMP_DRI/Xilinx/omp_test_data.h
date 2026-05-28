@@ -1,6 +1,6 @@
 /* ==========================================================
  * FILE D? LI?U ???C T?O T? ??NG T? MATLAB
- * Dùng cho Xilinx SDK / Vitis (AXI DMA)
+ * DÃ¹ng cho Xilinx SDK / Vitis (AXI DMA)
  * ========================================================== */
 
 #ifndef OMP_TEST_DATA_H
